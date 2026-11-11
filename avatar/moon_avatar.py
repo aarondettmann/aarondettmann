@@ -3,9 +3,9 @@
 """Generate the halftone moon avatar as SVG files.
 
 The moon is a shaded sphere, printed in one ink on one paper color with a 45 degree
-halftone screen. The sky is a solid ink field with a circular hole for the moon. The dots
-are clipped to the limb, so the limb remains sharp. A smoothstep of the illumination gives
-a uniform lit area and a narrow terminator.
+halftone screen. The sky is a solid ink field; the moon is a paper disc printed over it.
+Dots that cross the limb print ink on ink, so the limb remains sharp. A smoothstep of the
+illumination gives a uniform lit area and a graded terminator.
 
 The maria, the large dark plains of the near side, are placed at approximate
 selenographic coordinates. Each mare is a soft disc on the sphere and is therefore
@@ -17,8 +17,10 @@ Usage (requires numpy):
 
     python3 moon_avatar.py [output-directory]
 
-This writes moon.svg and moon-earthshine.svg, by default next to this script. To export a
-PNG with the copyright notice (requires Inkscape and Pillow), run in this directory:
+This writes moon.svg and moon-earthshine.svg, by default next to this script. The mare
+boundaries depend on numpy's seeded Generator, whose stream may change between numpy
+releases. To export a PNG with the copyright notice (requires Inkscape and Pillow), run in
+this directory:
 
     inkscape moon.svg -o moon.png -w 1024 --export-background-opacity=1
     python3 -c "import moon_avatar; moon_avatar.tag_png('moon.png')"
@@ -27,6 +29,7 @@ PNG with the copyright notice (requires Inkscape and Pillow), run in this direct
 import math
 import sys
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import numpy as np
 
@@ -41,14 +44,17 @@ MARIA = [
     (-16, 33, 15),   # Mare Imbrium
     (18, 28, 9),     # Mare Serenitatis
     (31, 8, 11),     # Mare Tranquillitatis
-    (59, 17, 6),     # Mare Crisium
-    (51, -8, 8),     # Mare Fecunditatis
+    (59, 17, 7),     # Mare Crisium
+    (51, -8, 10),    # Mare Fecunditatis
     (35, -15, 5),    # Mare Nectaris
     (-17, -21, 10),  # Mare Nubium
     (-39, -24, 5),   # Mare Humorum
-    (2, 56, 5),      # Mare Frigoris
 ]
 # fmt: on
+# Mare Frigoris is omitted: at one to two screen cells wide it prints as a dashed line.
+
+# Mare radius, in degrees, at which the boundary noise has its nominal amplitude.
+REFERENCE_RADIUS = 15
 
 
 def unit(lon, lat):
@@ -83,14 +89,32 @@ def perlin(x, y, seed=0):
 
 
 def smoothstep(e0, e1, v):
+    """Cubic Hermite step from 0 at v <= e0 to 1 at v >= e1. Requires e0 < e1."""
     s = np.clip((v - e0) / (e1 - e0), 0, 1)
     return s * s * (3 - 2 * s)
+
+
+def dot_radius(ink):
+    """Dot radius, in units of the screen spacing, that covers the fraction ink of the paper.
+
+    Up to radius 1/sqrt(2) each dot overlaps only its four neighbors, two lenses per cell,
+    and the coverage reaches 1. The coverage is inverted by table interpolation. At ink 1
+    the radius 0.75 exceeds 1/sqrt(2), so solid areas print without specks where four dots
+    meet, at output widths of about 256 px and above. The radius jumps to 0.75 only at ink 1.
+    """
+    r = np.linspace(0, 1 / math.sqrt(2), 2001)
+    h = np.clip(0.5 / np.maximum(r, 1e-12), -1, 1)
+    lens = 2 * r * r * np.arccos(h) - 0.5 * np.sqrt(np.clip(4 * r * r - 1, 0, None))
+    cover = np.pi * r * r - 2 * lens
+    return np.where(ink < 1, np.interp(ink, cover, r), 0.75)
 
 
 def maria_cover(x, y, z, roughness=9.0, seed=7):
     """Coverage of the maria, in 0..1, at points (x, y, z) on the visible unit hemisphere.
 
-    x points right (east), y down (south) and z toward the viewer.
+    x points right (east), y down (south) and z toward the viewer. roughness scales the
+    boundary noise: the displacement peaks at about 0.7 times roughness degrees for a mare
+    of radius REFERENCE_RADIUS and is proportional to the radius.
     """
     lon = np.degrees(np.arctan2(x, z))
     lat = np.degrees(np.arcsin(np.clip(-y, -1, 1)))
@@ -99,7 +123,8 @@ def maria_cover(x, y, z, roughness=9.0, seed=7):
     for lo, la, rad in MARIA:
         cx, cy, cz = unit(lo, la)
         dist = np.degrees(np.arccos(np.clip(x * cx + y * cy + z * cz, -1, 1)))
-        cover = np.maximum(cover, 1 - smoothstep(rad * 0.45, rad * 1.35, dist + wobble * rad / 15))
+        shift = wobble * rad / REFERENCE_RADIUS
+        cover = np.maximum(cover, 1 - smoothstep(rad * 0.45, rad * 1.35, dist + shift))
     return cover
 
 
@@ -110,11 +135,11 @@ def moon_svg(
     radius=170.0,
     center=(232.0, 262.0),
     light=(0.78, -0.36, 0.52),
-    edge=(0.04, 0.62),
-    maria=0.2,
+    edge=(0.16, 0.5),
+    maria=0.33,
     earthshine=0.0,
     angle=45,
-    min_dot=0.15,
+    min_dot=0.5,
     title="Halftone moon",
 ):
     """Return the avatar as an SVG document. The screen grid is anchored at the moon's center.
@@ -122,7 +147,7 @@ def moon_svg(
     light: direction toward the sun, in the axes of maria_cover.
     edge: illumination values (cosine of incidence) at which the terminator starts and ends.
     maria: relative darkening at full maria coverage.
-    min_dot: dot radius in SVG units below which dots are omitted.
+    min_dot: dot radius in SVG units at or below which dots are omitted.
     """
     cx, cy = center
     R = radius
@@ -134,37 +159,33 @@ def moon_svg(
     a = math.radians(angle)
     X = cx + U * math.cos(a) - V * math.sin(a)
     Y = cy + U * math.sin(a) + V * math.cos(a)
-    keep = np.hypot(X - cx, Y - cy) < R + spacing
-    X, Y = X[keep], Y[keep]
+    d = np.hypot(U, V)
+    keep = d < R + spacing
+    X, Y, d = X[keep], Y[keep], d[keep]
 
     x, y = (X - cx) / R, (Y - cy) / R
     z = np.sqrt(np.clip(1 - x * x - y * y, 0, 1))
-    day = smoothstep(edge[0], edge[1], np.clip(lx * x + ly * y + lz * z, 0, 1))
+    day = smoothstep(edge[0], edge[1], lx * x + ly * y + lz * z)
     b = earthshine + (1 - earthshine) * day
     b = b * (1 - maria * maria_cover(x, y, z))
 
-    # Dots of radius spacing / sqrt(2) cover the paper; 0.72 slightly exceeds this, so the
-    # night side prints as solid ink.
-    r = spacing * 0.72 * np.sqrt(1 - b)
+    # Dots that cross the limb print ink on ink; a clip would add a second antialiased edge at
+    # the limb. Dots that lie entirely outside the disc are omitted.
+    r = spacing * dot_radius(1 - b)
     dots = "".join(
         f'<circle cx="{px:.2f}" cy="{py:.2f}" r="{q:.2f}"/>'
-        for px, py, q in zip(X, Y, r)
-        if q > min_dot
+        for px, py, q, dist in zip(X, Y, r, d)
+        if q > min_dot and dist - q < R
     )
 
-    # The sky overlaps the moon slightly; otherwise a hairline of paper shows at the limb.
-    hole = R - 1.2
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {SIZE} {SIZE}" '
         f'width="{SIZE}" height="{SIZE}">\n'
         f"  <!-- {COPYRIGHT} -->\n"
-        f"  <title>{title}</title>\n"
-        f'  <defs><clipPath id="disc"><circle cx="{cx}" cy="{cy}" r="{R}"/></clipPath></defs>\n'
-        f'  <rect width="{SIZE}" height="{SIZE}" fill="{paper}"/>\n'
-        f'  <path d="M0,0 H{SIZE} V{SIZE} H0Z M{cx - hole:.1f},{cy:.1f} '
-        f"a{hole:.1f},{hole:.1f} 0 1 0 {2 * hole:.1f},0 "
-        f'a{hole:.1f},{hole:.1f} 0 1 0 {-2 * hole:.1f},0Z" fill="{ink}" fill-rule="evenodd"/>\n'
-        f'  <g fill="{ink}" clip-path="url(#disc)">{dots}</g>\n'
+        f"  <title>{escape(title)}</title>\n"
+        f'  <rect width="{SIZE}" height="{SIZE}" fill="{ink}"/>\n'
+        f'  <circle cx="{cx}" cy="{cy}" r="{R}" fill="{paper}"/>\n'
+        f'  <g fill="{ink}">{dots}</g>\n'
         f"</svg>\n"
     )
 
@@ -175,13 +196,17 @@ def tag_png(path):
 
     info = PngImagePlugin.PngInfo()
     info.add_text("Copyright", COPYRIGHT)
-    Image.open(path).convert("RGB").save(path, optimize=True, pnginfo=info)
+    with Image.open(path) as im:
+        rgb = im.convert("RGB")
+    rgb.save(path, optimize=True, pnginfo=info)
 
 
 if __name__ == "__main__":
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent
-    (out / "moon.svg").write_text(moon_svg())
-    # The default center places the lit part in the middle; with earthshine the whole disc shows.
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "moon.svg").write_text(moon_svg(), encoding="utf-8")
+    # With earthshine the whole disc shows, so it is centered.
     (out / "moon-earthshine.svg").write_text(
-        moon_svg(earthshine=0.16, center=(256.0, 256.0), title="Halftone moon with earthshine")
+        moon_svg(earthshine=0.05, center=(256.0, 256.0), title="Halftone moon with earthshine"),
+        encoding="utf-8",
     )
